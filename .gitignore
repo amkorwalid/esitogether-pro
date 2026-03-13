@@ -1,5 +1,7 @@
 # Custom .gitignore 
-**/data/
+*.doc
+*.pdf
+*.docx
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
