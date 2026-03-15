@@ -1,29 +1,29 @@
-from docling.document_converter import (
-    DocumentConverter,
-    ConversionParameters,
-    PageRange,
-)
 from pathlib import Path
-import fitz  # PyMuPDF, just to get page count safely
+import io
+
+import fitz  # PyMuPDF
+from docling.document_converter import DocumentConverter
 
 
 def docs_to_markdown(pdf_path: Path, output_dir: Path, batch_size: int = 10) -> bool:
     """
-    Convert a large PDF document to Markdown format in page batches and
-    save it to the specified output directory.
+    Convert a large PDF to Markdown in batches of `batch_size` pages by:
+        - reading page ranges with PyMuPDF,
+        - building small in-memory PDFs for each batch,
+        - converting each batch with Docling,
+        - appending the resulting Markdown to a single output file.
 
-    The PDF is processed in batches of `batch_size` pages (default: 10)
-    using Docling's PageRange, to reduce memory usage on very large PDFs.
+    No intermediate PDF files are written to disk.
 
     Args:
-        pdf_path (Path): The path to the PDF document to be converted.
-        output_dir (Path): The directory where the converted Markdown file will be saved.
-        batch_size (int): Number of pages per Docling conversion batch.
+        pdf_path (Path): Path to the source PDF.
+        output_dir (Path): Directory where the final Markdown file is written.
+        batch_size (int): Number of pages per batch (default: 10).
 
     Returns:
-        bool: True if the conversion and saving are successful, False otherwise.
+        bool: True on success, False if any step fails.
     """
-    # --- Basic checks ---
+    # --- Sanity checks -------------------------------------------------------
     try:
         if not pdf_path.is_file():
             raise FileNotFoundError(f"The specified PDF file does not exist: {pdf_path}")
@@ -31,7 +31,6 @@ def docs_to_markdown(pdf_path: Path, output_dir: Path, batch_size: int = 10) -> 
         print(f"Error: {e}")
         return False
 
-    # Create output dir if needed
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
@@ -48,60 +47,77 @@ def docs_to_markdown(pdf_path: Path, output_dir: Path, batch_size: int = 10) -> 
             print(f"Error occurred while deleting existing Markdown file: {e}")
             return False
 
-    # --- Get total page count (using PyMuPDF) ---
+    # --- Open source PDF & initialize Docling converter ---------------------
     try:
-        with fitz.open(pdf_path) as doc:
-            page_count = doc.page_count
+        src_doc = fitz.open(pdf_path)
     except Exception as e:
-        print(f"Error opening PDF to get page count: {e}")
+        print(f"Error opening PDF with PyMuPDF: {e}")
         return False
 
-    # --- Initialize converter once ---
+    page_count = src_doc.page_count
+
     try:
         converter = DocumentConverter()
     except Exception as e:
         print(f"Error initializing DocumentConverter: {e}")
+        src_doc.close()
         return False
 
-    # --- Process in batches of `batch_size` pages ---
-    # Docling PageRange is usually 1-based (start/end inclusive)
+    # --- Process in page batches --------------------------------------------
     try:
+        # Create / truncate the output file once
         with open(output_file, "w", encoding="utf-8") as f_out:
-            # Optional: write a header or initial newline if you like
-            f_out.write("")  # start clean
+            f_out.write("")
 
-        for start_page in range(1, page_count + 1, batch_size):
-            end_page = min(start_page + batch_size - 1, page_count)
+        for start_index in range(0, page_count, batch_size):
+            end_index = min(start_index + batch_size, page_count)
+            print(f"Processing pages {start_index + 1}-{end_index} of {page_count}...")
 
-            print(f"Processing pages {start_page}-{end_page} of {page_count}...")
-
-            params = ConversionParameters(
-                page_range=PageRange(start=start_page, end=end_page)
-            )
-
+            # 1) Build a small in-memory PDF containing just this page range
+            batch_pdf_bytes_io = io.BytesIO()
             try:
-                result = converter.convert(pdf_path, parameters=params)
-                markdown_batch = result.document.export_to_markdown()
+                batch_doc = fitz.open()  # empty PDF
+                batch_doc.insert_pdf(
+                    src_doc,
+                    from_page=start_index,
+                    to_page=end_index - 1,
+                )
+                batch_doc.save(batch_pdf_bytes_io)
+                batch_doc.close()
             except Exception as e:
-                # Log the batch that failed and continue or abort.
-                # Here we abort and return False; you could choose to skip instead.
-                print(f"Error converting pages {start_page}-{end_page}: {e}")
+                print(f"Error creating in-memory batch PDF for pages {start_index + 1}-{end_index}: {e}")
+                src_doc.close()
                 return False
 
-            # Append this batch's markdown to the output file
+            batch_pdf_bytes_io.seek(0)
+            batch_pdf_bytes = batch_pdf_bytes_io.read()
+
+            # 2) Convert this in-memory PDF with Docling
+            try:
+                result = converter.convert(batch_pdf_bytes)
+                md_batch = result.document.export_to_markdown()
+            except Exception as e:
+                print(f"Error converting batch pages {start_index + 1}-{end_index} with Docling: {e}")
+                src_doc.close()
+                return False
+
+            # 3) Append batch markdown to final file
             try:
                 with open(output_file, "a", encoding="utf-8") as f_out:
-                    # separate batches with blank lines so they don't run together
-                    if start_page != 1:
-                        f_out.write("\n\n")
-                    f_out.write(markdown_batch)
+                    if start_index != 0:
+                        f_out.write("\n\n")  # separator between batches
+                    f_out.write(md_batch)
             except Exception as e:
-                print(f"Error occurred while saving Markdown for pages {start_page}-{end_page}: {e}")
+                print(f"Error writing Markdown for pages {start_index + 1}-{end_index}: {e}")
+                src_doc.close()
                 return False
 
     except Exception as e:
         print(f"Unexpected error during batched processing: {e}")
+        src_doc.close()
         return False
+    finally:
+        src_doc.close()
 
     print(f"Markdown successfully written to {output_file}")
     return True
